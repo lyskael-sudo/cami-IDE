@@ -1,0 +1,89 @@
+appId: com.cami.ide
+productName: Cami
+copyright: Copyright © 2026 Cami
+
+directories:
+  output: release
+
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - package.json
+  - assets/icons/512x512.png
+
+asar: true
+asarUnpack:
+  - node_modules/node-pty/**/*
+compression: maximum
+npmRebuild: true
+removePackageScripts: true
+
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+
+win:
+  executableName: Cami
+  target:
+    - target: nsis
+      arch:
+        - x64
+        - arm64
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Cami
+
+mac:
+  category: public.app-category.developer-tools
+  darkModeSupport: true
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+    - target: zip
+      arch:
+        - x64
+        - arm64
+
+linux:
+  executableName: cami
+  icon: assets/icons
+  syncDesktopName: true
+  extraResources:
+    - from: gole/package.json
+      to: gole/package.json
+    - from: gole/src
+      to: gole/src
+    - from: gole/node_modules
+      to: gole/node_modules
+    - from: native/webkit-browser/build/cami-webkit-browser
+      to: native/cami-webkit-browser
+  category: Development
+  synopsis: IDE de bureau moderne
+  description: Cami est un IDE de bureau léger et moderne, propulsé par Electron, React et Monaco Editor.
+  maintainer: Cami <hello@cami.dev>
+  target:
+    - target: AppImage
+      arch:
+        - x64
+        - arm64
+    - target: deb
+      arch:
+        - x64
+        - arm64
+  desktop:
+    entry:
+      Name: Cami
+      Comment: IDE de bureau moderne
+      Categories: Development;IDE;
+      StartupWMClass: cami
+
+deb:
+  depends:
+    - libgtk-3-0
+    - libwebkit2gtk-4.1-0
+    - libjson-glib-1.0-0

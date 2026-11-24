@@ -1,0 +1,531 @@
+// src/agent.js — The core agent loop that ties everything together
+'use strict';
+
+const fs                           = require('fs');
+const path                         = require('path');
+const config                       = require('./config');
+const logger                       = require('./logger');
+const DeepSeekBrowser              = require('./browser');
+const InputUI                      = require('./ui');
+const { TOOLS, executeTool }       = require('./tools');
+const web                          = require('./tools/browser');
+const subagentsTool                = require('./tools/subagents');
+const { stopProcesses }            = require('./tools/shell');
+const { walk }                     = require('./tools/util');
+const { connectMcpServers,
+        closeMcp }                 = require('./mcp');
+const { parseResponse,
+        extractCommentary }        = require('./parser');
+const { ConversationManager }      = require('./prompt');
+const { SubagentPool }             = require('./subagents');
+
+// Slash commands: [command, description]
+const COMMANDS = [
+  ['/new_chat',     'start a fresh DeepSeek chat'],
+  ['/stop',         'stop the running task (or press Esc)'],
+  ['/continue',     'keep going after the step limit'],
+  ['/history',      'list saved chats'],
+  ['/subagents',      'on|off — let DeepSeek spawn parallel subagents on its own when needed'],
+  ['/subagents-max',  'set MAX_SUBAGENTS, e.g. /subagents-max 6'],
+  ['/resume <n>',   'reopen chat number n from /history'],
+  ['/context',      'show estimated context usage'],
+  ['/headless on',  'restart browser invisibly'],
+  ['/headless off', 'restart browser with a window'],
+  ['/help',         'show this list'],
+  ['/exit',         'quit'],
+];
+
+const HISTORY_FILE = path.join(config.GOLE_HOME, 'history.json');
+
+function loadHistory() {
+  try { return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); } catch { return []; }
+}
+
+// ─────────────────────────────────────────────
+//  Agent class
+// ─────────────────────────────────────────────
+
+class DeepSeekAgent {
+  constructor(options = {}) {
+    this.browser      = new DeepSeekBrowser();
+    this.browser.onLoginRequired = options.onLoginRequired || null;
+    this.conversation = new ConversationManager();
+    this.options      = options;
+    this._running     = false;
+    this._abort       = false;   // set by stop(): finish current wait, then end the task
+    this._inbox       = [];      // messages typed while the agent is working
+    this.interactive  = false;
+  }
+
+  // ── Public API ──────────────────────────────────────────────────────────────
+
+  /** Boot the browser, load DeepSeek and connect MCP servers (before the first prompt lists the tools) */
+  async init({ mcp = true } = {}) {
+    await this.browser.launch();
+    web.bind(this.browser);
+    this._subagentPool = new SubagentPool(this.browser);
+    subagentsTool.bind(this._subagentPool); // lets DeepSeek call spawn_subagents itself, not just /subagents
+    if (mcp) await connectMcpServers();
+    await this.browser.newChat();
+  }
+
+  /** Shut down cleanly */
+  async shutdown() {
+    stopProcesses();
+    closeMcp();
+    await web.closeWeb();
+    await this.browser.close();
+  }
+
+  /**
+   * Run a task to completion.
+   * Returns the final response string.
+   */
+  async run(task) {
+    this._running   = true;
+    this._abort     = false;
+    this._ctrl      = new AbortController(); // stop() aborts the running tool (e.g. a long command)
+    this.browser.abort = false;
+    this._emit({ type: 'state', state: 'running' });
+    try {
+      return await this._runLoop(task);
+    } finally {
+      this._running = false; // also on throw, so stop() / Ctrl+C behave after a failed task
+      this._emit({ type: 'state', state: 'ready' });
+    }
+  }
+
+  _emit(event) {
+    if (typeof this.options.onEvent === 'function') this.options.onEvent(event);
+  }
+
+  async _runLoop(task) {
+    if (this.interactive) logger.dim('Esc or /stop = stop · type a message + Enter = send it with the next step');
+    const maxIter   = config.MAX_ITERATIONS;
+    let formatRetries = 0; // "looks like a tool call" re-asks in a row — capped so a final answer can't loop
+    let incompleteRetries = 0; // mid-stream re-reads in a row — capped so a truly broken read can't loop
+    let expectNew = true;      // false after an incomplete read: re-read the same message, don't wait for a new one
+
+    // ── 1. Build and send first message (or follow-up in an existing chat) ─
+    logger.header(`Task: ${task.slice(0, 80)}${task.length > 80 ? '…' : ''}`);
+
+    const firstMsg = this.conversation.primed
+      ? this.conversation.buildFollowUpMessage(task)
+      : this.conversation.buildFirstMessage(task, this._getWorkingDirListing(), this.options.subagentInfo, this.browser.provider.label);
+    this._chatTask = this._chatTask || task; // first task of this chat: history title + rollover context
+
+    if (config.DEBUG) {
+      logger.dim('--- First message (truncated) ---');
+      logger.dim(firstMsg.slice(0, 600) + '...');
+    }
+
+    logger.info(`Sending task to ${this.browser.provider.label}...`);
+    await this._send(firstMsg);
+
+    // ── 2. Agent loop ──────────────────────────────────────────────────────
+    for (let iter = 1; iter <= maxIter; iter++) {
+      if (this._abort) return this._stopped();
+      logger.iteration(iter, maxIter);
+      this.ui?.setStatus({ step: `${iter}/${maxIter}` });
+      this._showContext();
+
+      // Wait for response from DeepSeek
+      const rawResponse = await this.browser.waitForResponse(expectNew);
+      expectNew = true;
+      this._saveHistory();
+      if (this._abort) return this._stopped();
+
+      if (!rawResponse || rawResponse.trim().length === 0) {
+        logger.warn('Empty response received — retrying...');
+        await this._send('Please continue. If you are waiting for input, proceed with your best judgement.');
+        continue;
+      }
+
+      if (config.DEBUG) {
+        logger.dim(`--- Raw response (${rawResponse.length} chars) ---`);
+        logger.dim(rawResponse.slice(0, 400));
+      }
+
+      // Record the AI response in conversation history
+      this.conversation.addAssistantMessage(rawResponse);
+
+      // Parse the response
+      let parsed = parseResponse(rawResponse);
+
+      // ── Case 1: Tool call ──────────────────────────────────────────────
+      if (parsed.type === 'tool_call') {
+        formatRetries = 0;
+        incompleteRetries = 0;
+        const note = extractCommentary(rawResponse);
+        if (note) {
+          logger.thought(note);
+          this._emit({ type: 'thought', text: note });
+        }
+        logger.toolCall(parsed.name, parsed.args);
+        const visibleArgs = {};
+        for (const key of ['path', 'command', 'url', 'query', 'pattern', 'file', 'directory', 'cwd']) {
+          if (typeof parsed.args?.[key] === 'string') {
+            visibleArgs[key] = parsed.args[key].slice(0, 240);
+          }
+        }
+        this._emit({ type: 'tool-call', name: parsed.name, args: visibleArgs });
+        if (!Object.keys(parsed.args || {}).length) {
+          logger.dim('Empty args. Raw response: ' + JSON.stringify(rawResponse.slice(0, 600)));
+        }
+
+        let result;
+        let isError = false;
+
+        try {
+          result  = await executeTool(parsed.name, parsed.args, { signal: this._ctrl.signal, isSubagent: !!this.options.subagentInfo });
+          logger.toolResult(result);
+        } catch (err) {
+          result  = `Error: ${err.message}`;
+          isError = true;
+          logger.toolResult(result, true);
+        }
+        const visibleResult = String(result).slice(0, 1_500);
+        this._emit({ type: 'tool-result', name: parsed.name, result: visibleResult, isError });
+
+        // Feed result back
+        const feedbackMsg = this.conversation.addToolResult(parsed.name, result, isError);
+        await this._send(feedbackMsg);
+        continue;
+      }
+
+      // ── Case 1b: Read mid-stream — re-read the finished message ─────────
+      //  The page was scraped before DeepSeek finished; the model's output is
+      //  fine. Drop the partial message and re-read instead of scolding it.
+      if (parsed.type === 'incomplete') {
+        if (++incompleteRetries <= 3) {
+          logger.warn('Response read mid-stream — re-reading...');
+          this.conversation.popLastMessage();
+          expectNew = false;
+          continue;
+        }
+        // Give up re-reading: treat as a real parse error below.
+        parsed = { type: 'error', message: 'tool_call appeared truncated after repeated re-reads', raw: parsed.raw };
+      }
+
+      // ── Case 2: Parse error ────────────────────────────────────────────
+      if (parsed.type === 'error') {
+        logger.warn(`Parse error: ${parsed.message}`);
+        const recovery = this.conversation.addToolResult(
+          'SYSTEM',
+          `Parse error: ${parsed.message}\n\nPlease try again with valid JSON in your tool call.`,
+          true
+        );
+        await this._send(recovery);
+        continue;
+      }
+
+      // ── Case 3: Final response ─────────────────────────────────────────
+      if (parsed.type === 'final') {
+        // Safety net: if the "final" response text contains a tool_call block
+        // that our parser missed (e.g. garbled by DOM), send a correction prompt.
+        const head = parsed.content.slice(0, 200);
+        const looksLikeToolCall = (
+          /tool_call/i.test(parsed.content) ||
+          /"name"\s*:\s*"[\w_]+"/.test(parsed.content) ||
+          Object.keys(TOOLS).some(name => head.includes(name))
+        );
+
+        if (looksLikeToolCall && formatRetries++ < 2 && iter <= maxIter - 2) {
+          logger.warn('Response looks like a tool call but was not parsed — asking AI to retry format...');
+          const retry = this.conversation.addToolResult(
+            'SYSTEM',
+            'Your response appeared to contain a tool call but it could not be parsed. ' +
+            'Please respond with ONLY a ```tool_call code block and nothing else — no prose before or after it.',
+            true
+          );
+          await this._send(retry);
+          continue;
+        }
+
+        logger.finalOutput(parsed.content);
+        this._emit({ type: 'assistant', text: parsed.content });
+
+        // Optionally save conversation log
+        if (this.options.saveLog) {
+          await this._saveConversationLog(task, parsed.content);
+        }
+
+        return parsed.content;
+      }
+    }
+
+    // ── Hit max iterations ─────────────────────────────────────────────────
+    const warn = `Reached maximum iterations (${maxIter}). Type "continue" (or "дальше") to keep going.`;
+    logger.warn(warn);
+    return warn;
+  }
+
+  // ── Interactive (REPL) Mode ────────────────────────────────────────────────
+
+  /**
+   * Run the agent in interactive mode — keeps the browser open
+   * and accepts tasks one after another.
+   */
+  async runInteractive() {
+    const ui = this.ui = new InputUI();
+    ui.setCommands(COMMANDS);
+    ui.onEscape    = () => this.stop();
+    ui.onInterrupt = () => (this._running ? this.stop() : process.kill(process.pid, 'SIGINT'));
+    // Text sent while the agent works: /stop stops it, anything else is a message for the next step
+    ui.onBusyInput = text => {
+      if (['/stop', 'stop', '/стоп', 'стоп'].includes(text.trim().toLowerCase())) return this.stop();
+      this._inbox.push(text.trim());
+      logger.info(`Queued: ${text.trim().slice(0, 60)} (goes out with the next step)`);
+    };
+
+    logger.header('Interactive Mode — Type your task and press Enter');
+    logger.info('The chat continues between tasks. / opens commands (↑↓ select, Tab fills, Enter runs). Alt+Enter or a trailing \\ adds a new line.\n');
+
+    this.interactive = true;
+    ui.start();
+    ui.setStatus({ headless: config.HEADLESS, dir: path.basename(config.WORKING_DIR), subagents: config.SUBAGENTS_ENABLED });
+    this._showContext();
+
+    const ask = async () => ui.ask();
+    const runTask = async text => {
+      ui.setStatus({ busy: true });
+      try { return await this.run(text); }
+      finally { ui.setStatus({ busy: false, step: null }); }
+    };
+
+    while (true) {
+      let task;
+      if (this._inbox.length) {
+        task = this._inbox.splice(0).join('\n');
+        logger.info('Running your queued message...');
+      } else {
+        try {
+          const ans = await ask();
+          if (ans == null) break;
+          task = ans.trim();
+        } catch {
+          break; // stdin closed
+        }
+      }
+
+      if (!task) continue;
+
+      if (['continue', '/continue', 'дальше', 'продолжай', 'продолжи'].includes(task.toLowerCase())) {
+        try { await runTask('Continue the previous task from exactly where you stopped. Do not redo finished steps.'); }
+        catch (err) { logger.error(`Task failed: ${err.message}`); }
+        continue;
+      }
+
+      if (['exit', 'quit', 'q', '/exit', '/quit'].includes(task.toLowerCase())) {
+        logger.info('Exiting...');
+        break;
+      }
+
+      const hm = task.toLowerCase().match(/^\/?headless\s+(on|off)$/);
+      if (hm) {
+        const on = hm[1] === 'on';
+        logger.info(`Restarting browser (headless ${hm[1]})...`);
+        try {
+          await this.browser.relaunch(on);
+          ui.setStatus({ headless: on });
+          await this.browser.newChat();
+          this.conversation = new ConversationManager();
+        } catch (err) {
+          logger.error(`Relaunch failed: ${err.message}`);
+        }
+        continue;
+      }
+
+      if (['/new_chat', '/new', 'new'].includes(task.toLowerCase())) {
+        logger.info('Starting new chat...');
+        await this.browser.newChat();
+        this.conversation = new ConversationManager();
+        this._chatTask = null;
+        continue;
+      }
+
+      const sem = task.toLowerCase().match(/^\/subagents\s+(on|off)$/);
+      if (sem) {
+        config.SUBAGENTS_ENABLED = sem[1] === 'on';
+        ui.setStatus({ subagents: config.SUBAGENTS_ENABLED });
+        logger.success(`Subagents: ${sem[1]}`);
+        continue;
+      }
+
+      const smx = task.toLowerCase().match(/^\/subagents-max\s+(\d+)$/);
+      if (smx) {
+        config.MAX_SUBAGENTS = Math.max(1, Number(smx[1]));
+        logger.success(`MAX_SUBAGENTS: ${config.MAX_SUBAGENTS}`);
+        continue;
+      }
+
+      if (task.toLowerCase() === '/help') {
+        COMMANDS.forEach(([c, d]) => logger.info(`${c.padEnd(15)} ${d}`));
+        continue;
+      }
+
+      if (task.toLowerCase() === '/context') { this._showContext(); continue; }
+
+      if (task.toLowerCase() === '/history') { this._printHistory(); continue; }
+
+      const rm = task.match(/^\/resume\s+(\d+)$/i);
+      if (rm) {
+        const h = loadHistory()[Number(rm[1]) - 1];
+        if (!h) { logger.warn('No such chat. Use /history.'); continue; }
+        try {
+          await this.browser._navigate(h.url);
+          this.conversation = new ConversationManager();
+          this.conversation.primed    = true;
+          this.conversation.baseChars = h.chars || 0;
+          this._chatTask = h.title;
+          logger.success(`Resumed: ${h.title}`);
+          this._showContext();
+        } catch (err) {
+          logger.error(`Resume failed: ${err.message}`);
+        }
+        continue;
+      }
+
+      try {
+        await runTask(task);
+      } catch (err) {
+        logger.error(`Task failed: ${err.message}`);
+        if (config.DEBUG) console.error(err);
+      }
+    }
+
+    ui.stop();
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  /** Ask the running task to stop (also aborts the in-page wait + generation). */
+  stop() {
+    if (!this._running || this._abort) return;
+    this._abort = true;
+    this.browser.abort = true;
+    this._ctrl?.abort();
+    logger.warn('Stopping…');
+  }
+
+  _stopped() {
+    logger.warn('Stopped by user. Send a new message, or type "continue" to resume.');
+    return 'Stopped by user.';
+  }
+
+  /** Send a message; if the chat is >= CONTEXT_ROLLOVER of the limit, hand off to a fresh chat first. */
+  async _send(msg) {
+    if (this._inbox.length) {
+      const notes = this._inbox.splice(0).join('\n');
+      msg += '\n\nMESSAGE FROM THE USER (sent while you were working — take it into account now):\n' + notes;
+      this.conversation.baseChars += notes.length;
+      logger.info('↳ your message was delivered');
+    }
+    const projected = this.conversation.estimatedTokens + Math.ceil(msg.length / 3);
+    if (projected / config.CONTEXT_LIMIT >= config.CONTEXT_ROLLOVER) {
+      try { return await this._rollover(msg); }
+      catch (err) { logger.warn(`Rollover failed (${err.message}) — continuing in the same chat`); }
+    }
+    return this.browser.sendMessage(msg);
+  }
+
+  /** Ask DeepSeek for a handoff summary, then continue in a new chat with system prompt + summary. */
+  async _rollover(pendingMsg) {
+    logger.warn(`Context ≥ ${Math.round(config.CONTEXT_ROLLOVER * 100)}% — summarizing and moving to a new chat...`);
+    await this.browser.sendMessage(
+      'CONTEXT HANDOFF. Do NOT call any tools. Write a compact plain-text summary of this whole conversation ' +
+      'so a fresh chat can continue seamlessly: 1) the user\'s goal, 2) what is done (files created/changed, ' +
+      'commands run, results), 3) current state and known problems/errors, 4) exact remaining steps, ' +
+      '5) important paths, names and decisions.'
+    );
+    const summary = await this.browser.waitForResponse();
+    if (!summary || summary.trim().length < 50) throw new Error('empty summary');
+
+    await this.browser.newChat();
+    this.conversation = new ConversationManager();
+    const original    = (this._chatTask || '').replace(/^↪ /, '');
+    this._chatTask    = '↪ ' + original; // history marks the continuation chat
+
+    const task = [
+      'ORIGINAL TASK: ' + (original || '(see summary)'),
+      '',
+      'SUMMARY OF THE PREVIOUS CHAT (it ran out of context — continue from here, do not redo finished work):',
+      summary,
+      '',
+      'LATEST MESSAGE TO RESPOND TO:',
+      pendingMsg,
+    ].join('\n');
+    const first = this.conversation.buildFirstMessage(task, this._getWorkingDirListing(), null, this.browser.provider.label);
+    logger.success('New chat started with summary.');
+    return this.browser.sendMessage(first);
+  }
+
+  _showContext() {
+    const used  = this.conversation.estimatedTokens;
+    const limit = config.CONTEXT_LIMIT;
+    const pct   = Math.round(used / limit * 100);
+    const line  = `Context ≈ ${used.toLocaleString()} / ${limit.toLocaleString()} tokens (${pct}%)`;
+    this.ui?.setStatus({ ctx: `${pct}% (${Math.round(used / 1000)}k/${Math.round(limit / 1000)}k)` });
+    if (pct >= 80) logger.warn(line + ' — consider /new_chat');
+    else if (!this.ui) logger.dim(line);
+  }
+
+  /** Upsert this chat (keyed by DeepSeek chat URL) into history.json */
+  _saveHistory() {
+    if (this.options.subagentInfo) return; // throwaway subagent chats would push real ones out of /history
+    try {
+      const url = this.browser.page.url();
+      if (!/\/a\/chat\/s\//.test(url)) return; // chat not created yet
+      const list  = loadHistory();
+      const entry = list.find(h => h.url === url) || { url, title: (this._chatTask || '').slice(0, 60) };
+      entry.chars   = this.conversation.chars;
+      entry.updated = new Date().toISOString();
+      fs.writeFileSync(HISTORY_FILE, JSON.stringify([entry, ...list.filter(h => h !== entry)].slice(0, 50), null, 2));
+    } catch {}
+  }
+
+  _printHistory() {
+    const list = loadHistory();
+    if (!list.length) return logger.info('No saved chats yet.');
+    list.forEach((h, i) => logger.info(
+      `${String(i + 1).padStart(2)}. ${h.title}  \x1b[2m(${h.updated.slice(0, 16).replace('T', ' ')}, ~${Math.ceil(h.chars / 3)} tok)\x1b[0m`
+    ));
+    logger.dim('Resume with: /resume <n>');
+  }
+
+  _getWorkingDirListing() {
+    const root = config.WORKING_DIR;
+    const list = walk(root, { hidden: true, maxDepth: 3, limit: 80 })
+      .map(p => './' + path.relative(root, p) + (p.endsWith(path.sep) ? '/' : ''));
+    return list.join('\n') || '(empty directory)';
+  }
+
+  async _saveConversationLog(task, finalResponse) {
+    try {
+      const logsDir = path.join(config.GOLE_HOME, 'logs');
+      fs.mkdirSync(logsDir, { recursive: true });
+
+      const ts       = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const logFile  = path.join(logsDir, `session-${ts}.txt`);
+      const content  = [
+        `DeepSeek Agent — Session Log`,
+        `Date: ${new Date().toISOString()}`,
+        `Task: ${task}`,
+        `Working Dir: ${config.WORKING_DIR}`,
+        '═'.repeat(60),
+        this.conversation.exportLog(),
+        '',
+        '═'.repeat(60),
+        'FINAL RESPONSE:',
+        finalResponse,
+      ].join('\n');
+
+      fs.writeFileSync(logFile, content, 'utf8');
+      logger.dim(`Conversation saved: ${logFile}`);
+    } catch (err) {
+      logger.warn(`Could not save log: ${err.message}`);
+    }
+  }
+}
+
+module.exports = DeepSeekAgent;

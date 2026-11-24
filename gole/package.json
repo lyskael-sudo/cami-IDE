@@ -1,0 +1,60 @@
+{
+  "name": "gole",
+  "version": "2.0.0",
+  "description": "Universal browser AI agent — drives a real browser to talk to DeepSeek, Gemini and other web AIs, with multi-browser support (Chromium, Firefox, Brave, LibreWolf, Tor). No API key needed.",
+  "main": "src/index.js",
+  "bin": {
+    "gole": "src/index.js",
+    "dsa": "src/index.js",
+    "deepseek-agent": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "postinstall": "node src/postinstall.js",
+    "debug": "node src/index.js --debug",
+    "calibrate": "node src/index.js --calibrate",
+    "test": "node --test"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "gole.config.example.json"
+  ],
+  "dependencies": {
+    "playwright": "^1.45.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "gole",
+    "deepseek",
+    "gemini",
+    "browser-automation",
+    "playwright",
+    "coding-agent",
+    "subagents",
+    "multi-agent",
+    "multi-browser",
+    "cli",
+    "llm",
+    "mcp",
+    "model-context-protocol",
+    "web-automation",
+    "cdp"
+  ],
+  "author": "JustGimli",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JustGimli/gole.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JustGimli/gole/issues"
+  },
+  "homepage": "https://github.com/JustGimli/gole#readme"
+}

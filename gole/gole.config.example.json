@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy to gole.config.json (per-project) or ~/.gole/config.json (global). Priority: project > global > built-in defaults.",
+
+  "browser": "chromium",
+  "ai": "deepseek",
+
+  "HEADLESS": false,
+  "DEBUG": false,
+  "MAX_ITERATIONS": 300,
+  "STABLE_DELAY": 2500,
+  "RESPONSE_TIMEOUT": 180000,
+
+  "mcpServers": {
+    "example": {
+      "command": "npx",
+      "args": ["-y", "some-mcp-server"],
+      "env": { "API_KEY": "your_key" }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+dist-electron/
+release/
+native/webkit-browser/build/
+.vite/
+*.log
+*.tmp
+*.tmp.js
+.env
+.env.*
+!.env.example
+.DS_Store
